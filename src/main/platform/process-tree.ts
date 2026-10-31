@@ -188,6 +188,8 @@ export interface TerminateOptions {
   graceMs?: number;
   /** `rootPid` leads its own process group, which is signalled as a whole (default true) */
   group?: boolean;
+  /** Reject if any captured process/group still exists after bounded escalation. */
+  requireStopped?: boolean;
 }
 
 /**
@@ -209,7 +211,8 @@ export async function terminateProcessTree(rootPid: number, options: TerminateOp
   const late = collectTree(await readProcessTable(), rootPid).filter((pid) => !pids.includes(pid));
   if (group) send(-rootPid, 'SIGKILL');
   for (const pid of [...pids, ...late]) send(pid, 'SIGKILL');
-  await waitGone([...pids, ...late], groups, 2000);
+  const gone = await waitGone([...pids, ...late], groups, 2000);
+  if (!gone && options.requireStopped) throw new Error(`Owned process tree ${rootPid} did not stop after escalation`);
 }
 
 /** A signal to the groups, synchronously and without waiting (last moments of the app) */
@@ -218,10 +221,11 @@ export function signalGroupsNow(groupPids: Iterable<number>, signal: NodeJS.Sign
 }
 
 /** End a Windows process tree (pwsh mode): `taskkill /T /F /PID` */
-export async function taskkillTree(taskkillExe: string, pid: number): Promise<void> {
+export async function taskkillTree(taskkillExe: string, pid: number, requireStopped = false): Promise<void> {
   try {
     await execFileAsync(taskkillExe, ['/pid', String(pid), '/T', '/F'], { windowsHide: true, timeout: 15_000 });
-  } catch {
+  } catch (error) {
+    if (requireStopped) throw error;
     // Already gone, or taskkill itself failed: the caller still kills the direct child
   }
 }

@@ -40,6 +40,19 @@ must exit successfully and leave the candidate HEAD, tracked files and nonignore
 files unchanged. Source/target movement during verification blocks advancement. A failed command
 returns a blocked merge reason; it does not launch another agent, retry the checks or call GitHub.
 
+While a command is waiting or running, Workbench rechecks its pinned refs, task eligibility and
+candidate cleanliness. An obsolete candidate cancels its own command; on native runtimes bounded
+shutdown checks the captured descendants and owned process group before the queue admits another
+candidate. The queue stays blocked if shutdown cannot prove those processes stopped; this requires
+process inspection and a main-process restart after recovery. A detached descendant already
+reparented before a failed command is inspected may be invisible; the project command must also
+manage its own children and lock recovery safely. WSL retains its existing asynchronous process
+cleanup and needs separate qualification. Native Windows cleanup is also unqualified: a strict
+`taskkill` failure after the command already exited conservatively holds the queue. The project
+command must wait safely for a live
+cross-process lock owner instead of treating ordinary
+contention as a failed check. Workbench never deletes another verifier's lock or stops its process.
+
 The project command owns dependencies, durable logs, environment-sensitive receipt reuse and
 any cross-process resource lock. Workbench never turns an agent's reported check into a passing
 receipt. Ignored output directories are allowed; tracked references must remain unchanged.

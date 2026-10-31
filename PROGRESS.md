@@ -25,8 +25,9 @@ inspected in the running development app; future model wording remains a live qu
 
 Projects can opt into local merge verification through a tracked `.workbench-verify.json` on the
 target branch. Manual task merges, automatic merges and integration delivery verify the exact clean
-combined candidate before advancing refs. Commands are serialized in the main process; failures,
-changed candidates, moved refs and policy weakening block advancement without an AI repair round.
+combined candidate before advancing refs. Commands are serialized in the main process; stale or
+cancelled candidates stop their owned verifier before the next command. Failures, changed candidates,
+moved refs and policy weakening block advancement without an AI repair round.
 Projects without the policy keep their existing merge behavior. See [merge policy](docs/merge-status.md).
 
 Each spec-review ticket now requires a host-published, documentation-only update to root PROGRESS.md

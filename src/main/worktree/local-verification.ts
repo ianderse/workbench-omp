@@ -1,5 +1,5 @@
 import { git } from '../utils/git-exec';
-import { runRuntimeCommand } from '../platform/runtime-exec';
+import { runRuntimeCommand, RuntimeCommandCleanupError } from '../platform/runtime-exec';
 import { getIsolatedGitEnv } from '../utils/git-isolation';
 
 export const LOCAL_VERIFICATION_POLICY = '.workbench-verify.json';
@@ -33,6 +33,7 @@ export async function readLocalVerificationPolicy(projectDir: string, targetSha:
 }
 
 let verificationTail: Promise<void> = Promise.resolve();
+let unsafeCleanup: RuntimeCommandCleanupError | undefined;
 
 /** One heavy verification command at a time across this Workbench main process. */
 async function serialized<T>(work: () => Promise<T>): Promise<T> {
@@ -40,7 +41,10 @@ async function serialized<T>(work: () => Promise<T>): Promise<T> {
   let release!: () => void;
   verificationTail = new Promise<void>(resolve => { release = resolve; });
   await previous;
-  try { return await work(); } finally { release(); }
+  try {
+    if (unsafeCleanup) throw unsafeCleanup;
+    return await work();
+  } finally { release(); }
 }
 
 /** A clean immutable combined candidate is the only tree that can earn a passing gate. */
@@ -62,16 +66,46 @@ export async function verifyLocalCandidate(candidateDir: string, candidateSha: s
     };
     await assertUnchanged();
     const [command, ...args] = policy.command;
+    const controller = new AbortController();
+    let currentnessError: unknown;
+    let finished = false;
+    let timer: NodeJS.Timeout | undefined;
+    let checking: Promise<void> | undefined;
+    const scheduleCheck = () => {
+      timer = setTimeout(() => {
+        checking = (async () => {
+          await assertCurrent();
+          await assertUnchanged();
+        })().catch(error => {
+          currentnessError = error;
+          controller.abort();
+        }).finally(() => { if (!finished && !controller.signal.aborted) scheduleCheck(); });
+      }, 1000);
+    };
+    // The project command may be waiting on another process's repository lock.
+    // Stop our own waiting/running command when this candidate becomes obsolete.
+    scheduleCheck();
     try {
       await runRuntimeCommand(command, args, {
         cwd: candidateDir, timeout: policy.timeoutMs, maxBuffer: 16 * 1024 * 1024,
         env: getIsolatedGitEnv({ ...process.env, CI: '1', GIT_TERMINAL_PROMPT: '0' }),
+        signal: controller.signal, processGroup: true,
       });
     } catch (error) {
+      if (error instanceof RuntimeCommandCleanupError) {
+        unsafeCleanup = error;
+        throw error;
+      }
+      if (currentnessError) throw currentnessError;
       const failure = error as { stderr?: string; stdout?: string; message?: string };
       const detail = failure.stderr || failure.stdout || failure.message || String(error);
       throw new Error(`Local verification failed (${policy.command.join(' ')}): ${detail.slice(-8000)}. Target was not advanced; inspect the verification log before retrying.`);
+    } finally {
+      finished = true;
+      if (timer) clearTimeout(timer);
+      await checking;
     }
+    if (currentnessError) throw currentnessError;
     await assertUnchanged();
     await assertCurrent();
   });
