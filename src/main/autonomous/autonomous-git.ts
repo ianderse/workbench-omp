@@ -331,6 +331,7 @@ export async function autoMergeIntoTarget(input: AutoMergeInput): Promise<AutoMe
         log('Verifying the combined merge candidate locally');
         input.onProgress?.('verifying');
         await verifyLocalCandidate(dir, sha, verificationPolicy, async () => {
+          if (input.shouldContinue && !input.shouldContinue()) throw new Error('The task was moved during local verification');
           if ((await localBranchSha(projectDir, targetBranch)) !== targetSha) throw new Error('The target branch moved during local verification');
           if ((await localBranchSha(projectDir, taskBranch)) !== taskSha) throw new Error('The task branch moved during local verification');
         });

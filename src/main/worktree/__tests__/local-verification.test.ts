@@ -167,6 +167,54 @@ it('bounds the command by the target timeout and leaves the target untouched', a
   expect(git(f.project, 'rev-parse', 'main')).toBe(f.target);
 });
 
+it.each(['manual', 'automatic', 'integration'] as const)('cancels an obsolete waiting command and its detached child (%s)', async mode => {
+  const f = fixture(`const {spawn}=require('child_process');
+const child=spawn(process.execPath,['-e',\`const fs=require('fs');
+process.on('SIGTERM',()=>{fs.writeFileSync(${JSON.stringify(path.join(root, 'stopped'))},'stopped');process.exit(0)});
+fs.writeFileSync(${JSON.stringify(path.join(root, 'ready'))},'ready');setInterval(()=>{},1000);\`],{detached:true,stdio:'ignore'});
+fs.writeFileSync(marker,JSON.stringify({pid:process.pid,child:child.pid}));setInterval(()=>{},1000);`, 'waiting', 15_000);
+  const merging = merge(mode, f);
+  await vi.waitFor(() => expect(existsSync(path.join(root, 'ready'))).toBe(true), { timeout: 5000 });
+  const pids = JSON.parse(readFileSync(f.marker, 'utf8'));
+  const moved = git(f.project, 'commit-tree', `${f.target}^{tree}`, '-p', f.target, '-m', 'concurrent target');
+  git(f.project, 'update-ref', 'refs/heads/main', moved, f.target);
+  const result = await merging;
+  expect(result.success).toBe(false);
+  expect(failureText(result)).toContain('target branch moved');
+  expect(failureText(result)).not.toContain('Local verification failed');
+  expect(git(f.project, 'rev-parse', 'main')).toBe(moved);
+  expect(readFileSync(path.join(root, 'stopped'), 'utf8')).toBe('stopped');
+  expect(() => process.kill(pids.pid, 0)).toThrow();
+  expect(() => process.kill(pids.child, 0)).toThrow();
+});
+
+it('cancels a candidate changed while waiting and releases the queue for the next candidate', async () => {
+  const a = fixture(`fs.writeFileSync(marker,'waiting');setInterval(()=>{},1000);`, 'a', 15_000);
+  const b = fixture(`fs.writeFileSync(marker,'verified');`, 'b');
+  const policy = await readLocalVerificationPolicy(a.project, a.target);
+  const verification = verifyLocalCandidate(a.worktree, git(a.worktree, 'rev-parse', 'HEAD'), policy!, async () => {});
+  const rejection = expect(verification).rejects.toThrow('unchanged, clean merge candidate');
+  await vi.waitFor(() => expect(existsSync(a.marker)).toBe(true), { timeout: 5000 });
+  const next = merge('automatic', b);
+  writeFileSync(path.join(a.worktree, 'base.txt'), 'changed while waiting');
+  await rejection;
+  expect((await next).success).toBe(true);
+  expect(readFileSync(b.marker, 'utf8')).toBe('verified');
+  expect(git(a.project, 'rev-parse', 'main')).toBe(a.target);
+});
+
+it('cancels a waiting automatic merge when the task is no longer eligible', async () => {
+  const f = fixture(`fs.writeFileSync(marker,'waiting');setInterval(()=>{},1000);`, 'ineligible', 15_000);
+  let eligible = true;
+  const merging = autoMergeIntoTarget({ projectDir: f.project, worktreePath: f.worktree, targetBranch: 'main', taskTitle: 'Task', specId: '001', shouldContinue: () => eligible });
+  await vi.waitFor(() => expect(existsSync(f.marker)).toBe(true), { timeout: 5000 });
+  eligible = false;
+  const result = await merging;
+  expect(result.success).toBe(false);
+  expect(failureText(result)).toContain('task was moved during local verification');
+  expect(git(f.project, 'rev-parse', 'main')).toBe(f.target);
+});
+
 it('rejects symlink policies and unavailable target revisions instead of treating them as opt-out', async () => {
   const f = fixture('');
   await expect(readLocalVerificationPolicy(f.project, 'missing-target')).rejects.toThrow();

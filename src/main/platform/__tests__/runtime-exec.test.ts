@@ -70,6 +70,7 @@ vi.mock('../wsl-detect', () => ({ getWslExePath: () => 'C:\\Windows\\System32\\w
 
 import { EventEmitter } from 'events';
 import { PassThrough } from 'stream';
+import * as processTree from '../process-tree';
 import {
   WSL_WRAPPER,
   buildWslEnv,
@@ -77,6 +78,7 @@ import {
   parseBatchOutput,
   runTool,
   runRuntimeCommand,
+  RuntimeCommandCleanupError,
   runToolScript,
   spawnTool,
   wslSignalScript,
@@ -122,6 +124,52 @@ describe('runRuntimeCommand', () => {
     mocks.windows = true;
     await expect(runRuntimeCommand('npm.cmd', ['run', 'verify:local', '& unwanted'])).rejects.toThrow('unsupported Windows shell syntax');
     expect(mocks.execFile).not.toHaveBeenCalled();
+  });
+
+  it('waits for owned-tree cancellation and bounds a direct child that never closes', async () => {
+    const child = fakeChild();
+    mocks.spawn.mockReturnValue(child);
+    let finishCleanup!: () => void;
+    const terminate = vi.spyOn(processTree, 'terminateProcessTree').mockImplementation(() => new Promise(resolve => { finishCleanup = resolve; }));
+    const controller = new AbortController();
+    try {
+      const running = runRuntimeCommand('npm', ['run', 'verify:local'], { signal: controller.signal, processGroup: true });
+      const rejected = expect(running).rejects.toMatchObject({ name: 'AbortError' });
+      await vi.waitFor(() => expect(mocks.spawn).toHaveBeenCalled());
+      expect(mocks.spawn.mock.calls[0][2]).toMatchObject({ detached: true });
+      expect(mocks.spawn.mock.calls[0][2]).not.toHaveProperty('signal');
+      controller.abort();
+      expect(terminate).toHaveBeenCalledWith(child.pid, { group: true, requireStopped: true });
+      finishCleanup();
+      await rejected;
+    } finally { terminate.mockRestore(); }
+  });
+
+  it('reports uncertain cleanup even if a stubborn direct child keeps its pipes open', async () => {
+    mocks.spawn.mockReturnValue(fakeChild());
+    const terminate = vi.spyOn(processTree, 'terminateProcessTree').mockRejectedValue(new Error('owned child still alive'));
+    const controller = new AbortController();
+    try {
+      const running = runRuntimeCommand('npm', ['run', 'verify:local'], { signal: controller.signal, processGroup: true });
+      const rejected = expect(running).rejects.toBeInstanceOf(RuntimeCommandCleanupError);
+      await vi.waitFor(() => expect(mocks.spawn).toHaveBeenCalled());
+      controller.abort();
+      await rejected;
+    } finally { terminate.mockRestore(); }
+  });
+
+  it('cleans the owned tree on a command failure before returning its original error', async () => {
+    const child = fakeChild();
+    mocks.spawn.mockReturnValue(child);
+    const terminate = vi.spyOn(processTree, 'terminateProcessTree').mockResolvedValue();
+    try {
+      const running = runRuntimeCommand('npm', ['run', 'verify:local'], { processGroup: true, maxBuffer: 3 });
+      const rejected = expect(running).rejects.toMatchObject({ code: 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER' });
+      await vi.waitFor(() => expect(mocks.spawn).toHaveBeenCalled());
+      child.stdout.write('too much output');
+      await rejected;
+      expect(terminate).toHaveBeenCalledWith(9000, { group: true, requireStopped: true });
+    } finally { terminate.mockRestore(); }
   });
 });
 

@@ -69,6 +69,9 @@ export interface RunToolResult {
   stderr: string;
 }
 
+/** The owned command may still be running; another heavy verifier must not start. */
+export class RuntimeCommandCleanupError extends Error {}
+
 export interface SpawnToolOptions {
   cwd?: string;
   env?: NodeJS.ProcessEnv;
@@ -522,11 +525,12 @@ function stopWslProcess(child: ChildProcess, tracked: WslProcess, options: KillP
 // =============================================================================
 
 /** Run an explicit argv command in the selected runtime, without shell text interpolation. */
-export async function runRuntimeCommand(command: string, args: string[], options: Omit<RunToolOptions, 'command'> = {}): Promise<RunToolResult> {
+export async function runRuntimeCommand(command: string, args: string[], options: Omit<RunToolOptions, 'command'> & { processGroup?: boolean } = {}): Promise<RunToolResult> {
   await whenShellRuntimeReady();
+  const { processGroup, ...commandOptions } = options;
   const info = getWslInfo();
   if (info) {
-    const { cwd, env, encoding = 'utf8', windowsHide: _windowsHide, ...execOptions } = options;
+    const { cwd, env, encoding = 'utf8', windowsHide: _windowsHide, ...execOptions } = commandOptions;
     const running = execFileAsync(getWslExePath(), wslArgs(info.distro, cwd, [command, ...args.map(toRuntimeArg)]), {
       ...execOptions, env: buildWslEnv(env, info.loginPath), encoding, windowsHide: true,
     });
@@ -539,11 +543,72 @@ export async function runRuntimeCommand(command: string, args: string[], options
       throw cleanWslError(error, command, args);
     }
   }
-  const { encoding = 'utf8', ...execOptions } = options;
+  const { encoding = 'utf8', ...execOptions } = commandOptions;
   const launch = nativeLaunch(command, args);
   // Windows command shims require a shell. Refuse shell syntax rather than interpreting argv as code.
   if (launch.shell && [command, ...args].some(value => /[&|<>()^%!`$\r\n"]/.test(value))) {
     throw new Error('Runtime command arguments contain unsupported Windows shell syntax');
+  }
+  if (processGroup) {
+    // Do not let execFile abort npm before the descendant walk. Its runner may have
+    // started a separate verification process group, which must finish cleanup too.
+    const { signal, timeout, maxBuffer = 1024 * 1024, ...ownedOptions } = execOptions;
+    signal?.throwIfAborted();
+    const child = spawn(launch.file, launch.args, { ...ownedOptions, shell: launch.shell, detached: !isWindows(), stdio: ['ignore', 'pipe', 'pipe'] });
+    const output = { stdout: [] as Buffer[], stderr: [] as Buffer[] };
+    const lengths = { stdout: 0, stderr: 0 };
+    const result = () => ({ stdout: Buffer.concat(output.stdout).toString(encoding), stderr: Buffer.concat(output.stderr).toString(encoding) });
+    const running = new Promise<RunToolResult>((resolve, reject) => {
+      child.once('error', reject);
+      child.once('close', (code, signal) => {
+        if (code === 0 && signal === null) resolve(result());
+        else reject(Object.assign(new Error(`Command failed: ${command} ${args.join(' ')}`), result(), { code, signal }));
+      });
+    });
+    let stopping: Promise<void> | undefined;
+    let stopped: Error | undefined;
+    let cleanupFailure: RuntimeCommandCleanupError | undefined;
+    let rejectInterrupted!: (error: Error) => void;
+    const interrupted = new Promise<never>((_resolve, reject) => { rejectInterrupted = reject; });
+    const stop = (error: Error) => {
+      if (stopping) return;
+      stopped = error;
+      const pid = child.pid;
+      stopping = (async () => {
+        if (pid === undefined) return;
+        if (isWindows()) await taskkillTree(getTaskkillExePath(), pid, true);
+        else await terminateProcessTree(pid, { group: true, requireStopped: true });
+      })().catch(reason => {
+        cleanupFailure = new RuntimeCommandCleanupError(`Could not prove the owned verification process tree stopped: ${String(reason)}`);
+      }).then(() => { rejectInterrupted(cleanupFailure ?? error); });
+    };
+    for (const stream of ['stdout', 'stderr'] as const) child[stream]?.on('data', (chunk: Buffer) => {
+      const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      const remaining = maxBuffer - lengths[stream];
+      if (remaining > 0) output[stream].push(bytes.subarray(0, remaining));
+      lengths[stream] += bytes.length;
+      if (lengths[stream] > maxBuffer) stop(Object.assign(new Error(`${stream} exceeded maxBuffer (${maxBuffer} bytes)`), { code: 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER' }));
+    });
+    const abort = () => stop(Object.assign(new Error('Runtime command cancelled'), { name: 'AbortError', code: 'ABORT_ERR' }));
+    signal?.addEventListener('abort', abort, { once: true });
+    if (signal?.aborted) abort();
+    const timer = timeout ? setTimeout(() => stop(new Error(`Runtime command timed out after ${timeout}ms`)), timeout) : undefined;
+    try {
+      // Cleanup is bounded even if an unkillable direct child keeps its pipes open.
+      const result = await Promise.race([running, interrupted]);
+      if (stopped) throw stopped;
+      return result;
+    } catch (error) {
+      // Nonzero exit and maxBuffer errors may also leave a group behind.
+      stop(error instanceof Error ? error : new Error(String(error)));
+      await stopping;
+      throw cleanupFailure ?? stopped ?? error;
+    } finally {
+      if (timer) clearTimeout(timer);
+      signal?.removeEventListener('abort', abort);
+      // A new verifier may only enter the slot after our entire stopped tree settles.
+      await stopping;
+    }
   }
   const { stdout, stderr } = await execFileAsync(launch.file, launch.args, { ...execOptions, encoding, shell: launch.shell });
   return { stdout, stderr };
